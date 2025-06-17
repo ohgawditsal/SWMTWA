@@ -1,0 +1,302 @@
+import os
+import subprocess
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from tqdm import tqdm
+import shutil
+
+# --- LOCAL SETUP INSTRUCTIONS ---
+# Before running this script, ensure you have the following Python libraries installed:
+# pip install opencv-python numpy pandas scikit-learn matplotlib tqdm
+#
+# You will also need FFmpeg installed on your system and accessible via your PATH.
+# Download FFmpeg from: https://ffmpeg.org/download.html
+#
+# If you plan to download videos using yt-dlp, install it:
+# pip install yt-dlp
+# --------------------------------
+
+# ## STEP 2: CONFIGURATION AND PARAMETERS
+# TODO: CHANGE THIS to the local path of your video file.
+VIDEO_PATH = 'path/to/your/video_file.mp4' # Example: 'videos/royaljourney_1951.mp4'
+
+# TODO: CHANGE THIS to a base path on your local machine where all output will be saved.
+# The script will create subfolders within this path.
+OUTPUT_BASE_PATH = 'output' # Example: 'C:/Users/YourUser/Documents/FilmAnalysis' or './output'
+
+# Name for this specific film's analysis (used to create a unique output folder).
+FILM_NAME = 'royaljourney_1951'
+
+# Number of dominant colors to extract from each frame.
+K_CLUSTERS = 5
+
+# Number of frames to extract per second from the video.
+# 1 is a good default for general analysis.
+FPS_TO_EXTRACT = 1
+
+# Width to resize frames to for faster processing. Aspect ratio is maintained.
+RESIZE_WIDTH = 640
+
+# AUTOMATIC PATH CONFIGURATION
+# Create a main directory for this film's analysis.
+FILM_OUTPUT_PATH = os.path.join(OUTPUT_BASE_PATH, FILM_NAME)
+FRAMES_FOLDER = os.path.join(FILM_OUTPUT_PATH, 'frames')
+PLOTS_FOLDER = os.path.join(FILM_OUTPUT_PATH, 'plots')
+DATA_FOLDER = os.path.join(FILM_OUTPUT_PATH, 'data')
+
+# Create the necessary directories if they don't exist.
+os.makedirs(FRAMES_FOLDER, exist_ok=True)
+os.makedirs(PLOTS_FOLDER, exist_ok=True)
+os.makedirs(DATA_FOLDER, exist_ok=True)
+
+print(f"Configuration complete. Output will be saved to: {FILM_OUTPUT_PATH}")
+
+
+# ## STEP 3: HELPER FUNCTIONS
+
+def extract_frames(video_path, output_folder, fps):
+    """
+    Extracts frames from a video file using FFmpeg.
+    Args:
+        video_path (str): path to the video file.
+        output_folder (str): directory to save the extracted frames.
+        fps (int): number of frames to extract per second.
+    """
+    print(f"\n--- Starting Frame Extraction (at {fps} FPS) ---")
+
+    # Clean up old frames if they exist
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+    os.makedirs(output_folder)
+
+    command = [
+        'ffmpeg',
+        '-i', video_path,
+        '-vf', f'fps={fps}',
+        '-q:v', '2',  # high quality JPEGs
+        os.path.join(output_folder, 'frame_%05d.jpg')
+    ]
+    try:
+        # Using subprocess.run to execute the command
+        process = subprocess.run(command, check=True, capture_output=True, text=True)
+        print("Frames extracted successfully.")
+    except FileNotFoundError:
+        print("ERROR: FFmpeg not found. Please ensure FFmpeg is installed and added to your system's PATH.")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR during frame extraction: {e}")
+        print(f"FFmpeg stderr: {e.stderr}")
+
+def rgb_to_hex(rgb_color):
+    """Converts an RGB color tuple to a hex string."""
+    return mcolors.to_hex(np.array(rgb_color) / 255.0)
+
+def analyze_frame_colors(frame_path, k, resize_width):
+    """
+    Analyzes a single image frame to extract dominant colors and average HSV.
+    Args:
+        frame_path (str): path to the image file.
+        k (int): number of dominant colors to find.
+        resize_width (int): width to resize the image to.
+    Returns:
+        dict: a dictionary containing analysis results, or None if error.
+    """
+    try:
+        # Load the image with OpenCV
+        img = cv2.imread(frame_path)
+        if img is None:
+            print(f"Could not load image at {frame_path}. Skipping.")
+            return None
+
+        # Resize the image to speed up processing
+        aspect_ratio = img.shape[0] / img.shape[1]
+        new_height = int(resize_width * aspect_ratio)
+        resized_img = cv2.resize(img, (resize_width, new_height), interpolation=cv2.INTER_AREA)
+
+        # Convert from BGR (OpenCV default) to RGB for analysis and display
+        img_rgb = cv2.cvtColor(resized_img, cv2.COLOR_BGR2RGB)
+
+        # Convert to HSV for calculating average values
+        img_hsv = cv2.cvtColor(resized_img, cv2.COLOR_BGR2HSV)
+        avg_h = np.mean(img_hsv[:, :, 0])
+        avg_s = np.mean(img_hsv[:, :, 1])
+        avg_v = np.mean(img_hsv[:, :, 2])
+
+        # Reshape the image to be a list of pixels for k-means
+        pixels = img_rgb.reshape((-1, 3))
+        pixels = np.float32(pixels)
+
+        # Perform k-means clustering
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+        kmeans.fit(pixels)
+
+        # Get the cluster centers (dominant colors) and their proportions
+        dominant_colors_rgb = kmeans.cluster_centers_.astype(int)
+        labels, counts = np.unique(kmeans.labels_, return_counts=True)
+        proportions = counts / len(pixels)
+
+        # Sort colors by proportion (most dominant first)
+        sorted_indices = np.argsort(proportions)[::-1]
+        dominant_colors_rgb = dominant_colors_rgb[sorted_indices]
+        proportions = proportions[sorted_indices]
+
+        # Convert dominant colors to hex codes
+        dominant_colors_hex = [rgb_to_hex(color) for color in dominant_colors_rgb]
+
+        return {
+            'dominant_colors_hex': dominant_colors_hex,
+            'dominant_colors_rgb': [tuple(c) for c in dominant_colors_rgb],
+            'proportions': proportions.tolist(),
+            'avg_hue': avg_h,
+            'avg_saturation': avg_s,
+            'avg_value': avg_v
+        }
+
+    except Exception as e:
+        print(f"Could not process frame {frame_path}: {e}")
+        return None
+
+
+# ## STEP 4: VISUALIZATION FUNCTIONS
+
+def plot_color_barcode(df, output_path, title):
+    """Generates and saves a color barcode visualization for the film."""
+    print("\n--- Generating Color Barcode ---")
+    num_frames = len(df)
+    barcode = np.zeros((max(100, num_frames // 10), num_frames, 3), dtype=np.uint8)
+
+    # Get the most dominant color for each frame
+    dominant_colors = [colors[0] for colors in df['dominant_colors_rgb']]
+
+    for i, color in enumerate(dominant_colors):
+        barcode[:, i, :] = color
+
+    plt.figure(figsize=(20, 3))
+    plt.imshow(barcode, aspect='auto')
+    plt.title(title, fontsize=16)
+    plt.xlabel("Time (Frame Number / Extracted FPS)")
+    plt.yticks([])
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Color barcode saved to {output_path}")
+
+def plot_temporal_graphs(df, output_path_base, title):
+    """Generates and saves plots of average HSV over time."""
+    print("\n--- Generating Temporal HSV Plots ---")
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10), sharex=True)
+    fig.suptitle(f'Color Properties Over Time: {title}', fontsize=16)
+
+    # Hue plot
+    ax1.plot(df.index, df['avg_hue'], color='r', alpha=0.7)
+    ax1.set_title('Average Hue')
+    ax1.set_ylabel('Hue (0-179)')
+    ax1.grid(True, linestyle='--', alpha=0.5)
+
+    # Saturation plot
+    ax2.plot(df.index, df['avg_saturation'], color='g', alpha=0.7)
+    ax2.set_title('Average Saturation')
+    ax2.set_ylabel('Saturation (0-255)')
+    ax2.grid(True, linestyle='--', alpha=0.5)
+
+    # Value (brightness) plot
+    ax3.plot(df.index, df['avg_value'], color='b', alpha=0.7)
+    ax3.set_title('Average Value (Brightness)')
+    ax3.set_ylabel('Value (0-255)')
+    ax3.set_xlabel('Time (Frame Number / Extracted FPS)')
+    ax3.grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    output_path = f"{output_path_base}_hsv_temporal.png"
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Temporal graphs saved to {output_path}")
+
+def plot_overall_palette(df, output_path, title, top_n=10):
+    """Generates and saves a summary color palette for the entire film."""
+    print("\n--- Generating Overall Film Palette ---")
+    all_colors = []
+    all_proportions = []
+
+    for _, row in df.iterrows():
+        all_colors.extend(row['dominant_colors_rgb'])
+        all_proportions.extend(row['proportions'])
+
+    # Create a DataFrame of all dominant colors and their frame proportions
+    palette_df = pd.DataFrame({
+        'color_rgb': [tuple(c) for c in all_colors],
+        'proportion': all_proportions
+    })
+
+    # Group by color and sum the proportions to get overall dominance
+    overall_palette = palette_df.groupby('color_rgb')['proportion'].sum().sort_values(ascending=False)
+    overall_palette = (overall_palette / df.shape[0]) # Normalize by number of frames
+
+    top_colors = overall_palette.head(top_n)
+
+    plt.figure(figsize=(15, 3))
+    plt.pie(top_colors, labels=[str(c) for c in top_colors.index],
+            colors=[np.array(c)/255.0 for c in top_colors.index],
+            autopct='%1.1f%%', startangle=90)
+    plt.title(f'Overall Color Palette (Top {top_n} Dominant Hues): {title}', fontsize=14)
+    plt.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Overall palette saved to {output_path}")
+
+def plot_hue_histogram(df, output_path, title):
+    """Generates and saves a histogram of hue distribution for the entire film."""
+    print("\n--- Generating Hue Distribution Histogram ---")
+    plt.figure(figsize=(12, 6))
+    plt.hist(df['avg_hue'], bins=45, range=(0, 180), color='cyan', edgecolor='black')
+    plt.title(f'Overall Hue Distribution: {title}', fontsize=16)
+    plt.xlabel('Hue Value (0-179, from HSV)')
+    plt.ylabel('Number of Frames')
+    plt.grid(axis='y', alpha=0.75, linestyle='--')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"Hue histogram saved to {output_path}")
+
+
+# ## STEP 5: MAIN EXECUTION SCRIPT
+
+if __name__ == '__main__':
+    # --- 1. Extract frames ---
+    extract_frames(VIDEO_PATH, FRAMES_FOLDER, FPS_TO_EXTRACT)
+
+    # --- 2. Analyze frames ---
+    print("\n--- Analyzing Frames for Color Data ---")
+    frame_files = sorted([os.path.join(FRAMES_FOLDER, f) for f in os.listdir(FRAMES_FOLDER) if f.endswith('.jpg')])
+
+    all_frame_data = []
+
+    for frame_path in tqdm(frame_files, desc="Processing Frames"):
+        analysis_result = analyze_frame_colors(frame_path, K_CLUSTERS, RESIZE_WIDTH)
+        if analysis_result:
+            analysis_result['frame_path'] = os.path.basename(frame_path)
+            all_frame_data.append(analysis_result)
+
+    # --- 3. Aggregate data ---
+    if all_frame_data:
+        color_df = pd.DataFrame(all_frame_data)
+
+        # Save the DataFrame to a CSV file for future analysis
+        csv_path = os.path.join(DATA_FOLDER, f'{FILM_NAME}_color_analysis.csv')
+        color_df.to_csv(csv_path, index=False)
+        print(f"\nColor analysis data saved to: {csv_path}")
+
+        # --- 4. Generate visualizations ---
+        plot_color_barcode(color_df, os.path.join(PLOTS_FOLDER, f'{FILM_NAME}_barcode.png'), FILM_NAME)
+        plot_temporal_graphs(color_df, os.path.join(PLOTS_FOLDER, f'{FILM_NAME}'), FILM_NAME)
+        plot_overall_palette(color_df, os.path.join(PLOTS_FOLDER, f'{FILM_NAME}_palette.png'), FILM_NAME)
+        plot_hue_histogram(color_df, os.path.join(PLOTS_FOLDER, f'{FILM_NAME}_hue_hist.png'), FILM_NAME)
+
+        print("\n--- Analysis and Visualization Complete! ---")
+        print(f"All outputs can be found at: {FILM_OUTPUT_PATH}")
+    else:
+        print("\n--- No frames were processed. Halting script. ---")
